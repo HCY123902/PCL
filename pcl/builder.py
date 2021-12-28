@@ -2,12 +2,15 @@ import torch
 import torch.nn as nn
 from random import sample
 
+from encoder import UtteranceEncoder
+
 class MoCo(nn.Module):
     """
     Build a MoCo model with: a query encoder, a key encoder, and a queue
     https://arxiv.org/abs/1911.05722
     """
-    def __init__(self, base_encoder, dim=128, r=16384, m=0.999, T=0.1, mlp=False):
+    # def __init__(self, dim=128, r=16384, m=0.999, T=0.1, mlp=False):
+    def __init__(self, word_dict, word_emb, args):
         """
         dim: feature dimension (default: 128)
         r: queue size; number of negative samples/prototypes (default: 16384)
@@ -17,16 +20,22 @@ class MoCo(nn.Module):
         """
         super(MoCo, self).__init__()
 
-        self.r = r
-        self.m = m
-        self.T = T
+        self.r = args.pcl_r
+        self.m = args.moco_m
+        self.T = args.temperature
 
         # create the encoders
         # num_classes is the output fc dimension
-        self.encoder_q = base_encoder(num_classes=dim)
-        self.encoder_k = base_encoder(num_classes=dim)
 
-        if mlp:  # hack: brute-force replacement
+        # Adjusted
+        # self.encoder_q = base_encoder(num_classes=dim)
+        # self.encoder_k = base_encoder(num_classes=dim)
+        self.encoder_q = UtteranceEncoder(word_dict, word_emb=word_emb, bidirectional=args.bidirectional, \
+                                            n_layers=1, input_dropout=0, dropout=0, rnn_cell=args.arch, args=args)
+        self.encoder_k = UtteranceEncoder(word_dict, word_emb=word_emb, bidirectional=args.bidirectional, \
+                                            n_layers=1, input_dropout=0, dropout=0, rnn_cell=args.arch, args=args)
+
+        if args.mlp:  # hack: brute-force replacement
             dim_mlp = self.encoder_q.fc.weight.shape[1]
             self.encoder_q.fc = nn.Sequential(nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_q.fc)
             self.encoder_k.fc = nn.Sequential(nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_k.fc)

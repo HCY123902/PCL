@@ -25,6 +25,8 @@ import torchvision.models as models
 
 import pcl.loader
 import pcl.builder
+import pcl.utils
+import pcl.disentanglement_processing
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -33,11 +35,8 @@ model_names = sorted(name for name in models.__dict__
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 parser.add_argument('data', metavar='DIR',
                     help='path to dataset')
-parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
-                    choices=model_names,
-                    help='model architecture: ' +
-                        ' | '.join(model_names) +
-                        ' (default: resnet50)')
+parser.add_argument('-a', '--arch', default='lstm', type=str,
+                    help='model architecture: lstm | gru')
 parser.add_argument('-j', '--workers', default=32, type=int, metavar='N',
                     help='number of data loading workers (default: 32)')
 parser.add_argument('--epochs', default=200, type=int, metavar='N',
@@ -80,14 +79,31 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
 
-parser.add_argument('--low-dim', default=128, type=int,
-                    help='feature dimension (default: 128)')
+# parser.add_argument('--low-dim', default=128, type=int,
+#                     help='feature dimension (default: 128)')
 parser.add_argument('--pcl-r', default=16384, type=int,
                     help='queue size; number of negative pairs; needs to be smaller than num_cluster (default: 16384)')
 parser.add_argument('--moco-m', default=0.999, type=float,
                     help='moco momentum of updating key encoder (default: 0.999)')
 parser.add_argument('--temperature', default=0.2, type=float,
                     help='softmax temperature')
+
+# Added
+parser.add_argument('--embedding_size', default=300, type=int,
+                    help='embedding size (default: 300)')
+parser.add_argument('--hidden_size', default=300, type=int,
+                    help='hidden size (default: 300)')
+parser.add_argument('--state_num', default=16, type=int,
+                    help='state number (default: 16)')                
+parser.add_argument('--bidirectional', action='store_true',
+                    help='use bidirectional model')
+parser.add_argument('--save_input_path', default="./input_saving/", type=str,
+                    help='the path to save the parsed set')
+parser.add_argument("--load_var", action='store_true')
+parser.add_argument('--glove_loc', type=str, default="../glove/glove.840B.300d.txt")
+parser.add_argument('--mode', default="contrast", type=str,
+                    help='the available mode: contrast | disentanglement')
+
 
 parser.add_argument('--mlp', action='store_true',
                     help='use mlp head')
@@ -137,13 +153,15 @@ def main():
         args.world_size = ngpus_per_node * args.world_size
         # Use torch.multiprocessing.spawn to launch distributed processes: the
         # main_worker process function
-        mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
+        if args.mode == "contrast":
+            mp.spawn(contrast_main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
     else:
         # Simply call main_worker function
-        main_worker(args.gpu, ngpus_per_node, args)
+        if args.mode == "contrast":
+            contrast_main_worker(args.gpu, ngpus_per_node, args)
 
 
-def main_worker(gpu, ngpus_per_node, args):
+def contrast_main_worker(gpu, ngpus_per_node, args):
     args.gpu = gpu
     
     if args.gpu is not None:
@@ -166,9 +184,35 @@ def main_worker(gpu, ngpus_per_node, args):
                                 world_size=args.world_size, rank=args.rank)
     # create model
     print("=> creating model '{}'".format(args.arch))
-    model = pcl.builder.MoCo(
-        models.__dict__[args.arch],
-        args.low_dim, args.pcl_r, args.moco_m, args.temperature, args.mlp)
+
+    # Added
+    all_utterances, labels, word_dict = pcl.disentanglement_processing.read_data(load_var=args.load_var, \
+                input_=os.path.join(args.data, "entangled_train.json"), mode='train')
+    dev_utterances, dev_labels, _ = pcl.disentanglement_processing.read_data(load_var=args.load_var, \
+                input_=os.path.join(args.data_path, "entangled_dev.json"), mode='dev')
+
+    word_emb = pcl.utils.build_embedding_matrix(word_dict, glove_loc=args.glove_loc, \
+                emb_loc=os.path.join(args.save_input_path, "word_emb.pk"), load_emb=False)
+
+    if args.save_input:
+        pcl.utils.save_or_read_input(os.path.join(args.save_input_path, "train_utterances.pk"), \
+                                    rw='w', input_obj=all_utterances)
+        pcl.utils.save_or_read_input(os.path.join(args.save_input_path, "train_labels.pk"), \
+                                    rw='w', input_obj=labels)
+        pcl.utils.save_or_read_input(os.path.join(args.save_input_path, "word_dict.pk"), \
+                                    rw='w', input_obj=word_dict)
+        pcl.utils.save_or_read_input(os.path.join(args.save_input_path, "word_emb.pk"), \
+                                    rw='w', input_obj=word_emb)
+        pcl.utils.save_or_read_input(os.path.join(args.save_input_path, "dev_utterances.pk"), \
+                                    rw='w', input_obj=dev_utterances)
+        pcl.utils.save_or_read_input(os.path.join(args.save_input_path, "dev_labels.pk"), \
+                                    rw='w', input_obj=dev_labels)
+
+    # Adjusted 
+    # model = pcl.builder.MoCo(
+    #     models.__dict__[args.arch],
+    #     args.hidden_size, args.pcl_r, args.moco_m, args.temperature, args.mlp)
+    model = pcl.builder.MoCo(word_dict=word_dict, word_emb=word_emb, args=args)
     print(model)
 
     if args.distributed:
@@ -226,49 +270,52 @@ def main_worker(gpu, ngpus_per_node, args):
 
     cudnn.benchmark = True
 
-    # Data loading code
-    traindir = os.path.join(args.data, 'train')
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
+    # # Data loading code
+    # traindir = os.path.join(args.data, 'train')
+    # normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+    #                                  std=[0.229, 0.224, 0.225])
     
-    if args.aug_plus:
-        # MoCo v2's aug: similar to SimCLR https://arxiv.org/abs/2002.05709
-        augmentation = [
-            transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
-            transforms.RandomApply([
-                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)  # not strengthened
-            ], p=0.8),
-            transforms.RandomGrayscale(p=0.2),
-            transforms.RandomApply([pcl.loader.GaussianBlur([.1, 2.])], p=0.5),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize
-        ]
-    else:
-        # MoCo v1's aug: same as InstDisc https://arxiv.org/abs/1805.01978
-        augmentation = [
-            transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
-            transforms.RandomGrayscale(p=0.2),
-            transforms.ColorJitter(0.4, 0.4, 0.4, 0.4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize
-        ]
+    # if args.aug_plus:
+    #     # MoCo v2's aug: similar to SimCLR https://arxiv.org/abs/2002.05709
+    #     augmentation = [
+    #         transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
+    #         transforms.RandomApply([
+    #             transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)  # not strengthened
+    #         ], p=0.8),
+    #         transforms.RandomGrayscale(p=0.2),
+    #         transforms.RandomApply([pcl.loader.GaussianBlur([.1, 2.])], p=0.5),
+    #         transforms.RandomHorizontalFlip(),
+    #         transforms.ToTensor(),
+    #         normalize
+    #     ]
+    # else:
+    #     # MoCo v1's aug: same as InstDisc https://arxiv.org/abs/1805.01978
+    #     augmentation = [
+    #         transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
+    #         transforms.RandomGrayscale(p=0.2),
+    #         transforms.ColorJitter(0.4, 0.4, 0.4, 0.4),
+    #         transforms.RandomHorizontalFlip(),
+    #         transforms.ToTensor(),
+    #         normalize
+    #     ]
         
-    # center-crop augmentation 
-    eval_augmentation = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        normalize
-        ])    
+    # # center-crop augmentation 
+    # eval_augmentation = transforms.Compose([
+    #     transforms.Resize(256),
+    #     transforms.CenterCrop(224),
+    #     transforms.ToTensor(),
+    #     normalize
+    #     ])    
        
-    train_dataset = pcl.loader.ImageFolderInstance(
-        traindir,
-        pcl.loader.TwoCropsTransform(transforms.Compose(augmentation)))
-    eval_dataset = pcl.loader.ImageFolderInstance(
-        traindir,
-        eval_augmentation)
+    # train_dataset = pcl.loader.ImageFolderInstance(
+    #     traindir,
+    #     pcl.loader.TwoCropsTransform(transforms.Compose(augmentation)))
+    # eval_dataset = pcl.loader.ImageFolderInstance(
+    #     traindir,
+    #     eval_augmentation)
+
+    train_dataset = pcl.loader.ContrastTrainDataSet(all_utterances, word_dict, labels)
+    eval_dataset = pcl.loader.ContrastTrainDataSet(dev_utterances, word_dict, dev_labels)
     
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
@@ -279,12 +326,12 @@ def main_worker(gpu, ngpus_per_node, args):
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
+        num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True, collate_fn=pcl.loader.collate_fn_nlg_turn)
     
     # dataloader for center-cropped images, use larger batch size to increase speed
     eval_loader = torch.utils.data.DataLoader(
         eval_dataset, batch_size=args.batch_size*5, shuffle=False,
-        sampler=eval_sampler, num_workers=args.workers, pin_memory=True)
+        sampler=eval_sampler, num_workers=args.workers, pin_memory=True, collate_fn=pcl.loader.collate_fn_nlg_turn)
     
     for epoch in range(args.start_epoch, args.epochs):
         
@@ -297,7 +344,7 @@ def main_worker(gpu, ngpus_per_node, args):
             cluster_result = {'im2cluster':[],'centroids':[],'density':[]}
             for num_cluster in args.num_cluster:
                 cluster_result['im2cluster'].append(torch.zeros(len(eval_dataset),dtype=torch.long).cuda())
-                cluster_result['centroids'].append(torch.zeros(int(num_cluster),args.low_dim).cuda())
+                cluster_result['centroids'].append(torch.zeros(int(num_cluster),args.hidden_size).cuda())
                 cluster_result['density'].append(torch.zeros(int(num_cluster)).cuda()) 
 
             if args.gpu == 0:
@@ -328,6 +375,11 @@ def main_worker(gpu, ngpus_per_node, args):
                 'state_dict': model.state_dict(),
                 'optimizer' : optimizer.state_dict(),
             }, is_best=False, filename='{}/checkpoint_{:04d}.pth.tar'.format(args.exp_dir,epoch))
+
+            model_name = '{}/checkpoint_{:04d}_encoder.pkl'.format(args.exp_dir,epoch)
+            # log_msg = "Saving model for step {} at '{}'".format(step_cnt, model_name)
+            # self.logger.info(log_msg)
+            torch.save(model.encoder_q.state_dict(), model_name)
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args, cluster_result=None):
@@ -392,7 +444,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args, cluster_result
 def compute_features(eval_loader, model, args):
     print('Computing features...')
     model.eval()
-    features = torch.zeros(len(eval_loader.dataset),args.low_dim).cuda()
+    features = torch.zeros(len(eval_loader.dataset),args.hidden_size).cuda()
     for i, (images, index) in enumerate(tqdm(eval_loader)):
         with torch.no_grad():
             images = images.cuda(non_blocking=True)
