@@ -104,7 +104,6 @@ parser.add_argument('--glove_loc', type=str, default="../glove/glove.840B.300d.t
 parser.add_argument('--mode', default="contrast", type=str,
                     help='the available mode: contrast | disentanglement')
 
-
 parser.add_argument('--mlp', action='store_true',
                     help='use mlp head')
 parser.add_argument('--aug-plus', action='store_true',
